@@ -6,6 +6,10 @@ use laptop_sensor_daemon::event::{
 use laptop_sensor_daemon::service::start_dbus_server;
 use snafu::{ResultExt, Snafu};
 use std::os::unix::fs::FileTypeExt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::{broadcast, watch};
 use tokio::{signal, sync::mpsc};
 use tracing::{debug, error, info, warn};
@@ -109,11 +113,15 @@ trait SensorProxy {
 async fn setup_sensor_proxy(
     connection: &Connection,
     event_tx: mpsc::Sender<SystemEvent>,
-) -> Result<(SensorProxyProxy<'static>, bool, bool, bool)> {
+) -> Result<(
+    SensorProxyProxy<'static>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+)> {
     let proxy = SensorProxyProxy::new(connection)
         .await
         .context(ProxyCreationSnafu)?;
-
     let props_proxy = PropertiesProxy::builder(connection)
         .destination("net.hadess.SensorProxy")
         .context(PropertyBuildSnafu)?
@@ -122,15 +130,12 @@ async fn setup_sensor_proxy(
         .build()
         .await
         .context(PropertyBuildSnafu)?;
-
     let interface_name =
         InterfaceName::try_from("net.hadess.SensorProxy").context(InterfaceNameConversionSnafu)?;
-
     let initial_props = props_proxy
         .get_all(interface_name.clone())
         .await
         .context(PropertyAccessSnafu)?;
-
     let has_accelerometer = initial_props
         .get("HasAccelerometer")
         .and_then(|v| bool::try_from(v).ok())
@@ -143,54 +148,11 @@ async fn setup_sensor_proxy(
         .get("HasProximity")
         .and_then(|v| bool::try_from(v).ok())
         .unwrap_or(false);
-
-    let mut claimed_accel = false;
-    let mut claimed_light = false;
-    let mut claimed_prox = false;
-
-    info!("正在唤醒可用传感器...");
-    if has_accelerometer {
-        proxy
-            .claim_accelerometer()
-            .await
-            .context(SensorMethodCallSnafu)?;
-        claimed_accel = true;
-        info!("加速度计 (已唤醒)");
-    }
-    if has_ambient_light {
-        proxy.claim_light().await.context(SensorMethodCallSnafu)?;
-        claimed_light = true;
-        info!("环境光传感器 (已唤醒)");
-    }
-    if has_proximity {
-        proxy
-            .claim_proximity()
-            .await
-            .context(SensorMethodCallSnafu)?;
-        claimed_prox = true;
-        info!("接近光传感器 (已唤醒)");
-    }
-
-    let tx_clone = event_tx.clone();
-    let props_proxy_clone = props_proxy.clone();
-
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Ok(props) = props_proxy_clone.get_all(interface_name).await {
-            for (key, value) in props {
-                let _ = tx_clone.send(SystemEvent::SensorProperty {
-                    name: key.to_string(),
-                    value,
-                });
-            }
-        }
-    });
-
     let mut changes_stream = props_proxy
         .receive_properties_changed()
         .await
         .context(PropertyBuildSnafu)?;
-
+    let event_tx_clone = event_tx.clone();
     tokio::spawn(async move {
         while let Some(signal) = changes_stream.next().await {
             if let Ok(args) = signal.args() {
@@ -198,7 +160,7 @@ async fn setup_sensor_proxy(
                     let Ok(value_owned) = value.try_to_owned() else {
                         continue;
                     };
-                    let _ = event_tx.send(SystemEvent::SensorProperty {
+                    let _ = event_tx_clone.send(SystemEvent::SensorProperty {
                         name: key.to_string(),
                         value: value_owned,
                     });
@@ -206,7 +168,58 @@ async fn setup_sensor_proxy(
             }
         }
     });
-
+    let tx_clone_initial = event_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Ok(props) = props_proxy.get_all(interface_name).await {
+            for (key, value) in props {
+                let _ = tx_clone_initial.send(SystemEvent::SensorProperty {
+                    name: key.to_string(),
+                    value,
+                });
+            }
+        }
+    });
+    let claimed_accel = Arc::new(AtomicBool::new(false));
+    let claimed_light = Arc::new(AtomicBool::new(false));
+    let claimed_prox = Arc::new(AtomicBool::new(false));
+    info!("已发送传感器并发唤醒指令...");
+    if has_accelerometer {
+        let proxy_clone = proxy.clone();
+        let flag = claimed_accel.clone();
+        tokio::spawn(async move {
+            if proxy_clone.claim_accelerometer().await.is_ok() {
+                flag.store(true, Ordering::SeqCst);
+                info!("加速度计 (就绪)");
+            } else {
+                warn!("加速度计唤醒失败");
+            }
+        });
+    }
+    if has_ambient_light {
+        let proxy_clone = proxy.clone();
+        let flag = claimed_light.clone();
+        tokio::spawn(async move {
+            if proxy_clone.claim_light().await.is_ok() {
+                flag.store(true, Ordering::SeqCst);
+                info!("环境光传感器 (就绪)");
+            } else {
+                warn!("环境光传感器唤醒失败");
+            }
+        });
+    }
+    if has_proximity {
+        let proxy_clone = proxy.clone();
+        let flag = claimed_prox.clone();
+        tokio::spawn(async move {
+            if proxy_clone.claim_proximity().await.is_ok() {
+                flag.store(true, Ordering::SeqCst);
+                info!("接近光传感器 (就绪)");
+            } else {
+                warn!("接近光传感器唤醒失败");
+            }
+        });
+    }
     Ok((proxy, claimed_accel, claimed_light, claimed_prox))
 }
 
@@ -254,13 +267,13 @@ async fn main() -> Result<()> {
 
     dbus_server_task.abort();
     // 最好的清理就是不清理
-    if claimed_light {
+    if claimed_light.load(Ordering::SeqCst) {
         let _ = sensor_proxy.release_light().await;
     }
-    if claimed_accel {
+    if claimed_accel.load(Ordering::SeqCst) {
         let _ = sensor_proxy.release_accelerometer().await;
     }
-    if claimed_prox {
+    if claimed_prox.load(Ordering::SeqCst) {
         let _ = sensor_proxy.release_proximity().await;
     }
 
