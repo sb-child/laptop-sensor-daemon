@@ -109,7 +109,7 @@ trait SensorProxy {
 async fn setup_sensor_proxy(
     connection: &Connection,
     event_tx: mpsc::Sender<SystemEvent>,
-) -> Result<SensorProxyProxy<'static>> {
+) -> Result<(SensorProxyProxy<'static>, bool, bool, bool)> {
     let proxy = SensorProxyProxy::new(connection)
         .await
         .context(ProxyCreationSnafu)?;
@@ -144,16 +144,22 @@ async fn setup_sensor_proxy(
         .and_then(|v| bool::try_from(v).ok())
         .unwrap_or(false);
 
+    let mut claimed_accel = false;
+    let mut claimed_light = false;
+    let mut claimed_prox = false;
+
     info!("正在唤醒可用传感器...");
     if has_accelerometer {
         proxy
             .claim_accelerometer()
             .await
             .context(SensorMethodCallSnafu)?;
+        claimed_accel = true;
         info!("加速度计 (已唤醒)");
     }
     if has_ambient_light {
         proxy.claim_light().await.context(SensorMethodCallSnafu)?;
+        claimed_light = true;
         info!("环境光传感器 (已唤醒)");
     }
     if has_proximity {
@@ -161,6 +167,7 @@ async fn setup_sensor_proxy(
             .claim_proximity()
             .await
             .context(SensorMethodCallSnafu)?;
+        claimed_prox = true;
         info!("接近光传感器 (已唤醒)");
     }
 
@@ -200,7 +207,7 @@ async fn setup_sensor_proxy(
         }
     });
 
-    Ok(proxy)
+    Ok((proxy, claimed_accel, claimed_light, claimed_prox))
 }
 
 pub fn spawn_event_processor(mut internal_rx: mpsc::Receiver<SystemEvent>) -> EventBus {
@@ -231,13 +238,11 @@ async fn main() -> Result<()> {
     let (internal_tx, internal_rx) = mpsc::channel::<SystemEvent>(100);
     let event_bus = spawn_event_processor(internal_rx);
     spawn_evdev_listener(internal_tx.clone()).await;
-    let conn: Connection = Connection::system().await.context(BusConnectionSnafu)?;
-    let sensor_proxy = setup_sensor_proxy(&conn, internal_tx.clone()).await?;
-
-    let dbus_server_task = start_dbus_server(&conn, event_bus)
+    let (conn, dbus_server_task) = start_dbus_server(event_bus)
         .await
         .context(BusConnectionSnafu)?;
-
+    let (sensor_proxy, claimed_accel, claimed_light, claimed_prox) =
+        setup_sensor_proxy(&conn, internal_tx.clone()).await?;
     info!("后台服务已就绪，正在持续监听硬件...");
 
     tokio::select! {
@@ -248,9 +253,16 @@ async fn main() -> Result<()> {
     }
 
     dbus_server_task.abort();
-    let _ = sensor_proxy.release_light().await;
-    let _ = sensor_proxy.release_accelerometer().await;
-    let _ = sensor_proxy.release_proximity().await;
+    // 最好的清理就是不清理
+    if claimed_light {
+        let _ = sensor_proxy.release_light().await;
+    }
+    if claimed_accel {
+        let _ = sensor_proxy.release_accelerometer().await;
+    }
+    if claimed_prox {
+        let _ = sensor_proxy.release_proximity().await;
+    }
 
     info!("退出完成。");
     Ok(())

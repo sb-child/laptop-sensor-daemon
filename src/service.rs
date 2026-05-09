@@ -80,13 +80,23 @@ pub async fn notify_and_update(
     Ok(())
 }
 
-pub async fn start_dbus_server(
-    conn: &Connection,
-    event_bus: EventBus,
-) -> zbus::Result<JoinHandle<()>> {
+pub async fn start_dbus_server(event_bus: EventBus) -> zbus::Result<(Connection, JoinHandle<()>)> {
     let initial_state = event_bus.state_rx.borrow().clone();
     let global_state = Arc::new(RwLock::new(initial_state));
-    let iface_handle = setup_dbus_service(conn, global_state).await?;
+    let service = SensorService {
+        state: global_state,
+    };
+    let path = "/org/sbchild/LaptopSensorDaemon";
+    let conn = Builder::system()?
+        .serve_at(path, service)?
+        .name("org.sbchild.LaptopSensorDaemon")?
+        .build()
+        .await?;
+
+    let iface_handle = conn
+        .object_server()
+        .interface::<_, SensorService>(path)
+        .await?;
     let mut rx = event_bus.event_tx.subscribe();
     let h = tokio::spawn(async move {
         while let Ok(device_event) = rx.recv().await {
@@ -95,5 +105,5 @@ pub async fn start_dbus_server(
             }
         }
     });
-    Ok(h)
+    Ok((conn, h))
 }
