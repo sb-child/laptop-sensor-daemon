@@ -3,6 +3,7 @@ use futures_util::StreamExt;
 use laptop_sensor_daemon::event::{
     DeviceEvent, DeviceState, EventBus, SystemEvent, parse_system_event,
 };
+use laptop_sensor_daemon::service::start_dbus_server;
 use snafu::{ResultExt, Snafu};
 use std::os::unix::fs::FileTypeExt;
 use tokio::sync::{broadcast, watch};
@@ -68,14 +69,6 @@ async fn spawn_evdev_listener(event_tx: mpsc::Sender<SystemEvent>) {
 
         if let Ok(state) = device.get_switch_state() {
             let is_tablet = state.contains(SwitchCode::SW_TABLET_MODE);
-            info!(
-                "初始物理开关状态: {}",
-                if is_tablet {
-                    "Tablet (平板模式)"
-                } else {
-                    "Laptop (笔记本模式)"
-                }
-            );
             let _ = event_tx.send(SystemEvent::TabletMode(is_tablet));
         }
 
@@ -174,7 +167,6 @@ async fn setup_sensor_proxy(
     let tx_clone = event_tx.clone();
     let props_proxy_clone = props_proxy.clone();
 
-    // 异步获取全量状态，延迟以确保传感器已完全唤醒
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if let Ok(props) = props_proxy_clone.get_all(interface_name).await {
@@ -192,7 +184,6 @@ async fn setup_sensor_proxy(
         .await
         .context(PropertyBuildSnafu)?;
 
-    // 监听属性变化事件
     tokio::spawn(async move {
         while let Some(signal) = changes_stream.next().await {
             if let Ok(args) = signal.args() {
@@ -214,7 +205,7 @@ async fn setup_sensor_proxy(
 
 pub fn spawn_event_processor(mut internal_rx: mpsc::Receiver<SystemEvent>) -> EventBus {
     let (state_tx, state_rx) = watch::channel(DeviceState::default());
-    let (event_tx, _) = broadcast::channel::<DeviceEvent>(100);
+    let (event_tx, _event_rx) = broadcast::channel::<DeviceEvent>(100);
     let bus_event_tx = event_tx.clone();
     tokio::spawn(async move {
         let mut current_state = DeviceState::default();
@@ -243,15 +234,20 @@ async fn main() -> Result<()> {
     let conn: Connection = Connection::system().await.context(BusConnectionSnafu)?;
     let sensor_proxy = setup_sensor_proxy(&conn, internal_tx.clone()).await?;
 
+    let dbus_server_task = start_dbus_server(&conn, event_bus)
+        .await
+        .context(BusConnectionSnafu)?;
+
     info!("后台服务已就绪，正在持续监听硬件...");
 
     tokio::select! {
         _ = signal::ctrl_c() => {
             info!("收到中断信号，正在安全清理资源...");
         }
-        // _ = start_rpc_server(event_bus.clone()) => {}
+        // ...
     }
 
+    dbus_server_task.abort();
     let _ = sensor_proxy.release_light().await;
     let _ = sensor_proxy.release_accelerometer().await;
     let _ = sensor_proxy.release_proximity().await;

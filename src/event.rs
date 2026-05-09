@@ -71,7 +71,6 @@ pub fn parse_system_event(sys_event: SystemEvent) -> Option<DeviceEvent> {
             has_changes = true;
         }
         SystemEvent::SensorProperty { name, value } => {
-            // value 是 OwnedValue，我们可以借用它作为 Value 来尝试转换
             let dbus_value = &*value;
             match name.as_str() {
                 "AccelerometerOrientation" => {
@@ -98,7 +97,7 @@ pub fn parse_system_event(sys_event: SystemEvent) -> Option<DeviceEvent> {
                         has_changes = true;
                     }
                 }
-                _ => {} // 忽略我们不关心的内部属性
+                _ => {}
             }
         }
     }
