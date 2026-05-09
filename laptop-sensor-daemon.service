@@ -1,0 +1,23 @@
+# /etc/systemd/system/laptop-sensor-daemon.service
+
+[Unit]
+Description=Laptop Sensor and Tablet Mode Daemon
+After=dbus.service iio-sensor-proxy.service
+Wants=iio-sensor-proxy.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+ExecStart=/usr/local/bin/laptop-sensor-daemon
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=laptop-sensor-daemon
+
+[Install]
+WantedBy=multi-user.target
