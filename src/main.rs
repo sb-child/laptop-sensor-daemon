@@ -1,16 +1,20 @@
 use evdev::{Device, EventType, SwitchCode};
 use futures_util::StreamExt;
+use inotify::{Inotify, WatchMask};
 use laptop_sensor_daemon::event::{
     DeviceEvent, DeviceState, EventBus, SystemEvent, parse_system_event,
 };
 use laptop_sensor_daemon::service::start_dbus_server;
 use snafu::{ResultExt, Snafu};
 use std::os::unix::fs::FileTypeExt;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 use tokio::sync::{broadcast, watch};
+use tokio::time::sleep;
 use tokio::{signal, sync::mpsc};
 use tracing::{debug, error, info, warn};
 use zbus::{Connection, fdo::PropertiesProxy, names::InterfaceName};
@@ -38,66 +42,93 @@ pub enum DaemonError {
 
 type Result<T, E = DaemonError> = std::result::Result<T, E>;
 
-fn find_tablet_mode_devices() -> Vec<Device> {
-    let mut devices = Vec::new();
-    let Ok(evdev_dir) = std::fs::read_dir("/dev/input") else {
-        return devices;
+async fn try_attach_tablet_device(path: PathBuf, event_tx: mpsc::Sender<SystemEvent>) {
+    sleep(Duration::from_millis(100)).await;
+    let Ok(device) = Device::open(&path) else {
+        return;
     };
-    for entry in evdev_dir.flatten() {
-        let path = entry.path();
-        if !path.is_dir()
-            && path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .starts_with("event")
-        {
-            if let Ok(device) = Device::open(&path) {
-                if device
-                    .supported_switches()
-                    .map_or(false, |sw| sw.contains(SwitchCode::SW_TABLET_MODE))
-                {
-                    devices.push(device);
-                }
+    if !device
+        .supported_switches()
+        .map_or(false, |sw| sw.contains(SwitchCode::SW_TABLET_MODE))
+    {
+        return;
+    }
+    let phys = device.physical_path().unwrap_or("Unknown").to_string();
+    let name = device.name().unwrap_or("Unknown").to_string();
+    info!("挂载平板模式开关监听: {} (物理路径: {})", name, phys);
+    if let Ok(state) = device.get_switch_state() {
+        let is_tablet = state.contains(SwitchCode::SW_TABLET_MODE);
+        let _ = event_tx.send(SystemEvent::TabletMode(is_tablet)).await;
+    }
+    let mut stream = match device.into_event_stream() {
+        Ok(s) => s,
+        Err(e) => {
+            error!("无法创建 evdev 异步流 [{}]: {}", phys, e);
+            return;
+        }
+    };
+    while let Ok(event) = stream.next_event().await {
+        if event.event_type() == EventType::SWITCH && event.code() == SwitchCode::SW_TABLET_MODE.0 {
+            let is_tablet = event.value() == 1;
+            let _ = event_tx.send(SystemEvent::TabletMode(is_tablet)).await;
+        }
+    }
+    warn!("设备已断开: {}", phys);
+}
+
+pub async fn spawn_evdev_listener(event_tx: mpsc::Sender<SystemEvent>) {
+    if let Ok(evdev_dir) = std::fs::read_dir("/dev/input") {
+        for entry in evdev_dir.flatten() {
+            let path = entry.path();
+            if !path.is_dir()
+                && path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .starts_with("event")
+            {
+                let tx_clone = event_tx.clone();
+                tokio::spawn(async move {
+                    try_attach_tablet_device(path, tx_clone).await;
+                });
             }
         }
     }
-    devices
-}
 
-async fn spawn_evdev_listener(event_tx: mpsc::Sender<SystemEvent>) {
-    let devices = find_tablet_mode_devices();
-    if devices.is_empty() {
-        warn!("未在系统中检测到任何声明支持平板模式的物理开关。");
-        return;
-    }
-    for device in devices {
-        let tx_clone = event_tx.clone();
-        tokio::spawn(async move {
-            let phys = device.physical_path().unwrap_or("Unknown").to_string();
-            let name = device.name().unwrap_or("Unknown").to_string();
-            info!("挂载平板模式开关监听: {} (物理路径: {})", name, phys);
-            if let Ok(state) = device.get_switch_state() {
-                let is_tablet = state.contains(SwitchCode::SW_TABLET_MODE);
-                let _ = tx_clone.send(SystemEvent::TabletMode(is_tablet)).await;
+    tokio::spawn(async move {
+        let inotify = match Inotify::init() {
+            Ok(i) => i,
+            Err(e) => {
+                error!("初始化 inotify 失败，热插拔监控将不可用: {}", e);
+                return;
             }
-            let mut stream = match device.into_event_stream() {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("无法创建 evdev 异步流 [{}]: {}", phys, e);
-                    return;
-                }
-            };
-            while let Ok(event) = stream.next_event().await {
-                if event.event_type() == EventType::SWITCH
-                    && event.code() == SwitchCode::SW_TABLET_MODE.0
-                {
-                    let is_tablet = event.value() == 1;
-                    let _ = tx_clone.send(SystemEvent::TabletMode(is_tablet)).await;
+        };
+        if let Err(e) = inotify.watches().add("/dev/input", WatchMask::CREATE) {
+            error!("无法监听 /dev/input 目录: {}", e);
+            return;
+        }
+        let mut buffer = [0; 1024];
+        let mut stream = match inotify.into_event_stream(&mut buffer) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("创建 inotify 异步流失败: {}", e);
+                return;
+            }
+        };
+        info!("已启动针对 /dev/input 的硬件热插拔监控...");
+        while let Some(Ok(event)) = stream.next().await {
+            if let Some(name) = event.name {
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("event") {
+                    let path = PathBuf::from("/dev/input").join(name);
+                    let tx_clone = event_tx.clone();
+                    tokio::spawn(async move {
+                        try_attach_tablet_device(path, tx_clone).await;
+                    });
                 }
             }
-        });
-    }
+        }
+    });
 }
 
 #[zbus::proxy(
