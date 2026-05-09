@@ -6,7 +6,6 @@ use laptop_sensor_daemon::event::{
 };
 use laptop_sensor_daemon::service::start_dbus_server;
 use snafu::{ResultExt, Snafu};
-use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -49,7 +48,7 @@ async fn try_attach_tablet_device(path: PathBuf, event_tx: mpsc::Sender<SystemEv
     };
     if !device
         .supported_switches()
-        .map_or(false, |sw| sw.contains(SwitchCode::SW_TABLET_MODE))
+        .is_some_and(|sw| sw.contains(SwitchCode::SW_TABLET_MODE))
     {
         return;
     }
