@@ -4,6 +4,7 @@ use snafu::{ResultExt, Snafu};
 use std::os::unix::fs::FileTypeExt;
 use tokio::signal;
 use tokio::sync::broadcast;
+use tracing::{debug, error, info, warn};
 use zbus::{Connection, fdo::PropertiesProxy, names::InterfaceName};
 
 #[derive(Debug, Snafu)]
@@ -21,10 +22,10 @@ pub enum DaemonError {
     PropertyBuild { source: zbus::Error },
 
     #[snafu(display("接口名称转换失败: {source}"))]
-    InterfaceNameConvertion { source: zbus::names::Error },
+    InterfaceNameConversion { source: zbus::names::Error },
 
     #[snafu(display("调用传感器唤醒/释放方法失败: {source}"))]
-    SensorMethod { source: zbus::Error },
+    SensorMethodCall { source: zbus::Error },
 }
 
 type Result<T, E = DaemonError> = std::result::Result<T, E>;
@@ -56,31 +57,35 @@ fn find_tablet_mode_device() -> Option<Device> {
     None
 }
 
-async fn spawn_evdev_listener(tx: broadcast::Sender<SystemEvent>) {
+async fn spawn_evdev_listener(event_tx: broadcast::Sender<SystemEvent>) {
     tokio::spawn(async move {
         let Some(device) = find_tablet_mode_device() else {
-            println!("[-] 未在系统中检测到平板模式物理开关。");
+            warn!("未在系统中检测到平板模式物理开关。");
             return;
         };
 
-        println!(
-            "[*] 找到平板模式开关: {:?}",
+        info!(
+            "找到平板模式开关: {:?}",
             device.physical_path().unwrap_or("Unknown")
         );
 
         if let Ok(state) = device.get_switch_state() {
             let is_tablet = state.contains(SwitchCode::SW_TABLET_MODE);
-            println!(
-                "    - 初始状态: {}",
-                if is_tablet { "Tablet" } else { "Laptop" }
+            info!(
+                "初始物理开关状态: {}",
+                if is_tablet {
+                    "Tablet (平板模式)"
+                } else {
+                    "Laptop (笔记本模式)"
+                }
             );
-            let _ = tx.send(SystemEvent::TabletMode(is_tablet));
+            let _ = event_tx.send(SystemEvent::TabletMode(is_tablet));
         }
 
         let mut stream = match device.into_event_stream() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[!] 无法创建 evdev 异步流: {}", e);
+                error!("无法创建 evdev 异步流: {}", e);
                 return;
             }
         };
@@ -90,7 +95,7 @@ async fn spawn_evdev_listener(tx: broadcast::Sender<SystemEvent>) {
                 && event.code() == SwitchCode::SW_TABLET_MODE.0
             {
                 let is_tablet = event.value() == 1;
-                let _ = tx.send(SystemEvent::TabletMode(is_tablet));
+                let _ = event_tx.send(SystemEvent::TabletMode(is_tablet));
             }
         }
     });
@@ -113,9 +118,8 @@ trait SensorProxy {
 
 async fn setup_sensor_proxy(
     connection: &Connection,
-    tx: broadcast::Sender<SystemEvent>,
+    event_tx: broadcast::Sender<SystemEvent>,
 ) -> Result<SensorProxyProxy<'static>> {
-    // 优雅地使用 Snafu 的 context 宏来包装底层 zbus::Error
     let proxy = SensorProxyProxy::new(connection)
         .await
         .context(ProxyCreationSnafu)?;
@@ -129,74 +133,79 @@ async fn setup_sensor_proxy(
         .await
         .context(PropertyBuildSnafu)?;
 
+    let interface_name =
+        InterfaceName::try_from("net.hadess.SensorProxy").context(InterfaceNameConversionSnafu)?;
+
     let initial_props = props_proxy
-        .get_all(
-            InterfaceName::try_from("net.hadess.SensorProxy")
-                .context(InterfaceNameConvertionSnafu)?,
-        )
+        .get_all(interface_name.clone())
         .await
         .context(PropertyAccessSnafu)?;
 
-    let has_accel = initial_props
+    let has_accelerometer = initial_props
         .get("HasAccelerometer")
         .and_then(|v| bool::try_from(v).ok())
         .unwrap_or(false);
-    let has_light = initial_props
+    let has_ambient_light = initial_props
         .get("HasAmbientLight")
         .and_then(|v| bool::try_from(v).ok())
         .unwrap_or(false);
-    let has_prox = initial_props
+    let has_proximity = initial_props
         .get("HasProximity")
         .and_then(|v| bool::try_from(v).ok())
         .unwrap_or(false);
 
-    println!("[*] 正在唤醒可用传感器...");
-    if has_accel {
+    info!("正在唤醒可用传感器...");
+    if has_accelerometer {
         proxy
             .claim_accelerometer()
             .await
-            .context(SensorMethodSnafu)?;
-        println!("    - 加速度计 (已唤醒)");
+            .context(SensorMethodCallSnafu)?;
+        info!("加速度计 (已唤醒)");
     }
-    if has_light {
-        proxy.claim_light().await.context(SensorMethodSnafu)?;
-        println!("    - 环境光传感器 (已唤醒)");
+    if has_ambient_light {
+        proxy.claim_light().await.context(SensorMethodCallSnafu)?;
+        info!("环境光传感器 (已唤醒)");
     }
-    if has_prox {
-        proxy.claim_proximity().await.context(SensorMethodSnafu)?;
-        println!("    - 接近光传感器 (已唤醒)");
+    if has_proximity {
+        proxy
+            .claim_proximity()
+            .await
+            .context(SensorMethodCallSnafu)?;
+        info!("接近光传感器 (已唤醒)");
     }
 
-    let tx_clone = tx.clone();
+    let tx_clone = event_tx.clone();
     let props_proxy_clone = props_proxy.clone();
-    let ifname =
-        InterfaceName::try_from("net.hadess.SensorProxy").context(InterfaceNameConvertionSnafu)?;
+
+    // 异步获取全量状态，延迟以确保传感器已完全唤醒
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        println!("\n=== 当前传感器全量状态 ===");
-        if let Ok(props) = props_proxy_clone.get_all(ifname).await {
+        if let Ok(props) = props_proxy_clone.get_all(interface_name).await {
+            debug!("=== 当前传感器全量状态 ===");
             for (key, value) in props {
                 let val_str = format!("{:?}", value);
-                println!("  {}: {}", key, val_str);
+                debug!("{}: {}", key, val_str);
                 let _ = tx_clone.send(SystemEvent::SensorProperty {
                     name: key.to_string(),
                     value: val_str,
                 });
             }
+            debug!("=========================");
         }
-        println!("=========================\n");
     });
 
     let mut changes_stream = props_proxy
         .receive_properties_changed()
         .await
         .context(PropertyBuildSnafu)?;
+
+    // 监听属性变化事件
     tokio::spawn(async move {
         while let Some(signal) = changes_stream.next().await {
             if let Ok(args) = signal.args() {
                 for (key, value) in args.changed_properties() {
                     let val_str = format!("{:?}", value);
-                    let _ = tx.send(SystemEvent::SensorProperty {
+                    let _ = event_tx.send(SystemEvent::SensorProperty {
                         name: key.to_string(),
                         value: val_str,
                     });
@@ -210,41 +219,43 @@ async fn setup_sensor_proxy(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (tx, mut rx) = broadcast::channel::<SystemEvent>(100);
+    // 初始化 tracing 格式化输出
+    tracing_subscriber::fmt::init();
 
-    spawn_evdev_listener(tx.clone()).await;
+    let (event_tx, mut event_rx) = broadcast::channel::<SystemEvent>(100);
 
-    // Snafu 错误处理触发示例
+    spawn_evdev_listener(event_tx.clone()).await;
+
     let conn = Connection::system().await.context(BusConnectionSnafu)?;
+    let sensor_proxy = setup_sensor_proxy(&conn, event_tx.clone()).await?;
 
-    let sensor_proxy = setup_sensor_proxy(&conn, tx.clone()).await?;
-
-    println!("[*] 正在持续监听事件流 (按 Ctrl+C 退出)...\n");
+    info!("正在持续监听事件流 (按 Ctrl+C 退出)...");
 
     loop {
         tokio::select! {
-            Ok(event) = rx.recv() => {
+            Ok(event) = event_rx.recv() => {
                 match event {
                     SystemEvent::TabletMode(is_tablet) => {
                         let state = if is_tablet { "Tablet Mode (平板模式)" } else { "Laptop Mode (笔记本模式)" };
-                        println!("\n[Hardware Switch] 状态变更: {}", state);
+                        info!("[Hardware Switch] 状态变更: {}", state);
                     }
                     SystemEvent::SensorProperty { name, value } => {
-                        println!("[Sensor Event] {} 变更为: {}", name, value);
+                        info!("[Sensor Event] {} 变更为: {}", name, value);
                     }
                 }
             }
             _ = signal::ctrl_c() => {
-                println!("\n\n[*] 收到中断信号，正在安全清理资源...");
+                info!("收到中断信号，正在安全清理资源...");
                 break;
             }
         }
     }
 
+    // 优雅释放传感器占用
     let _ = sensor_proxy.release_light().await;
     let _ = sensor_proxy.release_accelerometer().await;
     let _ = sensor_proxy.release_proximity().await;
 
-    println!("[*] 退出完成。");
+    info!("退出完成。");
     Ok(())
 }
