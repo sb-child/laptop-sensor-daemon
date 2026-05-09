@@ -11,8 +11,6 @@
 - **对象路径 (Object Path):** `/org/sbchild/LaptopSensorDaemon`
 - **主接口名称 (Interface):** `org.sbchild.LaptopSensorDaemon`
 
----
-
 ## 2. 属性参考 (Properties)
 
 本服务通过主接口暴露以下属性。所有属性均为 **只读 (Read-only)**。当底层硬件传感器发生物理变化时，这些属性的值会自动更新。
@@ -23,8 +21,6 @@
 | `Orientation` | `s`        | String   | 屏幕的物理朝向，通常用于控制操作系统的屏幕自动旋转。如果传感器未就绪，返回 `"undefined"`。 | `"normal"` (正常放置) / `"bottom-up"` (倒置)/ `"left-up"` (向左竖屏) / `"right-up"` (向右竖屏) |
 | `Tilt`        | `s`        | String   | 设备的立体倾斜状态，可用于判断设备是立起还是平放。如果传感器未就绪，返回 `"undefined"`。   | `"normal"` (正常立起) / `"tilted-down"` (屏幕面朝下放置) / `"face-up"` (屏幕面朝上平放)        |
 | `LightLevel`  | `d`        | Double   | 当前环境光传感器的读数（单位：lux）。如果硬件不支持或未就绪，返回 `0.0`。                  | `401.5`, `0.0`                                                                                 |
-
----
 
 ## 3. 信号与事件订阅 (Signals)
 
@@ -42,16 +38,12 @@
 2. `Dict<String, Variant>`: 发生变化的属性键值对字典（**增量更新**，只包含真正发生变化的属性）。
 3. `Array<String>`: 被标记为无效的属性列表（本服务极少使用，通常为空）。
 
----
-
 ## 4. 权限与安全说明
 
 由于本服务运行在系统总线 (`System Bus`) 上，访问受到严格的系统安全策略限制。
 
 - **普通用户/进程访问:** 允许读取所有属性 (`Get` / `GetAll`)，并允许接收属性变化信号 (`PropertiesChanged`)。不需要 `root` 权限即可对接。
 - _注意：如果客户端在连接时遭遇 `Access Denied`，请确保系统目录 `/etc/dbus-1/system.d/` 下存在本服务授权配置的 XML 文件，且包含 `<allow receive_sender="org.sbchild.LaptopSensorDaemon"/>` 策略。_
-
----
 
 ## 5. 客户端集成示例
 

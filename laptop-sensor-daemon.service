@@ -2,7 +2,7 @@
 
 [Unit]
 Description=Laptop Sensor and Tablet Mode Daemon
-After=dbus.service iio-sensor-proxy.service greetd.service
+After=dbus.service iio-sensor-proxy.service
 Wants=iio-sensor-proxy.service
 
 [Service]
