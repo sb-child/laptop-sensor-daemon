@@ -337,6 +337,7 @@ version = "0.1.0"
 dependencies = [
  "evdev",
  "futures-util",
+ "serde",
  "snafu",
  "tokio",
  "tracing",

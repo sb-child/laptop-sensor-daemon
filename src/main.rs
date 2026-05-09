@@ -1,11 +1,14 @@
 use evdev::{Device, EventType, SwitchCode};
 use futures_util::StreamExt;
+use laptop_sensor_daemon::event::{
+    DeviceEvent, DeviceState, EventBus, SystemEvent, parse_system_event,
+};
 use snafu::{ResultExt, Snafu};
 use std::os::unix::fs::FileTypeExt;
-use tokio::signal;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
+use tokio::{signal, sync::mpsc};
 use tracing::{debug, error, info, warn};
-use zbus::{Connection, fdo::PropertiesProxy, names::InterfaceName};
+use zbus::{Connection, fdo::PropertiesProxy, names::InterfaceName, zvariant::OwnedValue};
 
 #[derive(Debug, Snafu)]
 pub enum DaemonError {
@@ -30,12 +33,6 @@ pub enum DaemonError {
 
 type Result<T, E = DaemonError> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone)]
-pub enum SystemEvent {
-    TabletMode(bool),
-    SensorProperty { name: String, value: String },
-}
-
 fn find_tablet_mode_device() -> Option<Device> {
     let mut evdev_dir = std::fs::read_dir("/dev/input").ok()?;
     while let Some(Ok(entry)) = evdev_dir.next() {
@@ -57,7 +54,7 @@ fn find_tablet_mode_device() -> Option<Device> {
     None
 }
 
-async fn spawn_evdev_listener(event_tx: broadcast::Sender<SystemEvent>) {
+async fn spawn_evdev_listener(event_tx: mpsc::Sender<SystemEvent>) {
     tokio::spawn(async move {
         let Some(device) = find_tablet_mode_device() else {
             warn!("未在系统中检测到平板模式物理开关。");
@@ -118,7 +115,7 @@ trait SensorProxy {
 
 async fn setup_sensor_proxy(
     connection: &Connection,
-    event_tx: broadcast::Sender<SystemEvent>,
+    event_tx: mpsc::Sender<SystemEvent>,
 ) -> Result<SensorProxyProxy<'static>> {
     let proxy = SensorProxyProxy::new(connection)
         .await
@@ -181,16 +178,12 @@ async fn setup_sensor_proxy(
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if let Ok(props) = props_proxy_clone.get_all(interface_name).await {
-            debug!("=== 当前传感器全量状态 ===");
             for (key, value) in props {
-                let val_str = format!("{:?}", value);
-                debug!("{}: {}", key, val_str);
                 let _ = tx_clone.send(SystemEvent::SensorProperty {
                     name: key.to_string(),
-                    value: val_str,
+                    value,
                 });
             }
-            debug!("=========================");
         }
     });
 
@@ -204,10 +197,12 @@ async fn setup_sensor_proxy(
         while let Some(signal) = changes_stream.next().await {
             if let Ok(args) = signal.args() {
                 for (key, value) in args.changed_properties() {
-                    let val_str = format!("{:?}", value);
+                    let Ok(value_owned) = value.try_to_owned() else {
+                        continue;
+                    };
                     let _ = event_tx.send(SystemEvent::SensorProperty {
                         name: key.to_string(),
-                        value: val_str,
+                        value: value_owned,
                     });
                 }
             }
@@ -217,41 +212,46 @@ async fn setup_sensor_proxy(
     Ok(proxy)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 初始化 tracing 格式化输出
-    tracing_subscriber::fmt::init();
-
-    let (event_tx, mut event_rx) = broadcast::channel::<SystemEvent>(100);
-
-    spawn_evdev_listener(event_tx.clone()).await;
-
-    let conn = Connection::system().await.context(BusConnectionSnafu)?;
-    let sensor_proxy = setup_sensor_proxy(&conn, event_tx.clone()).await?;
-
-    info!("正在持续监听事件流 (按 Ctrl+C 退出)...");
-
-    loop {
-        tokio::select! {
-            Ok(event) = event_rx.recv() => {
-                match event {
-                    SystemEvent::TabletMode(is_tablet) => {
-                        let state = if is_tablet { "Tablet Mode (平板模式)" } else { "Laptop Mode (笔记本模式)" };
-                        info!("[Hardware Switch] 状态变更: {}", state);
-                    }
-                    SystemEvent::SensorProperty { name, value } => {
-                        info!("[Sensor Event] {} 变更为: {}", name, value);
-                    }
+pub fn spawn_event_processor(mut internal_rx: mpsc::Receiver<SystemEvent>) -> EventBus {
+    let (state_tx, state_rx) = watch::channel(DeviceState::default());
+    let (event_tx, _) = broadcast::channel::<DeviceEvent>(100);
+    let bus_event_tx = event_tx.clone();
+    tokio::spawn(async move {
+        let mut current_state = DeviceState::default();
+        while let Some(sys_event) = internal_rx.recv().await {
+            if let Some(device_event) = parse_system_event(sys_event) {
+                current_state.apply_event(&device_event);
+                let _ = state_tx.send(current_state.clone());
+                if bus_event_tx.receiver_count() > 0 {
+                    let _ = bus_event_tx.send(device_event.clone());
                 }
-            }
-            _ = signal::ctrl_c() => {
-                info!("收到中断信号，正在安全清理资源...");
-                break;
+                // if let Ok(json) = serde_json::to_string(&device_event) {
+                //     info!("[业务变更] {}", json);
+                // }
             }
         }
+    });
+    EventBus { state_rx, event_tx }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+    let (internal_tx, internal_rx) = mpsc::channel::<SystemEvent>(100);
+    let event_bus = spawn_event_processor(internal_rx);
+    spawn_evdev_listener(internal_tx.clone()).await;
+    let conn: Connection = Connection::system().await.context(BusConnectionSnafu)?;
+    let sensor_proxy = setup_sensor_proxy(&conn, internal_tx.clone()).await?;
+
+    info!("后台服务已就绪，正在持续监听硬件...");
+
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("收到中断信号，正在安全清理资源...");
+        }
+        // _ = start_rpc_server(event_bus.clone()) => {}
     }
 
-    // 优雅释放传感器占用
     let _ = sensor_proxy.release_light().await;
     let _ = sensor_proxy.release_accelerometer().await;
     let _ = sensor_proxy.release_proximity().await;
