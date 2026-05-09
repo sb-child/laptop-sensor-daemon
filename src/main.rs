@@ -13,7 +13,7 @@ use std::sync::{
 use tokio::sync::{broadcast, watch};
 use tokio::{signal, sync::mpsc};
 use tracing::{debug, error, info, warn};
-use zbus::{Connection, fdo::PropertiesProxy, names::InterfaceName, zvariant::OwnedValue};
+use zbus::{Connection, fdo::PropertiesProxy, names::InterfaceName};
 
 #[derive(Debug, Snafu)]
 pub enum DaemonError {
@@ -73,7 +73,7 @@ async fn spawn_evdev_listener(event_tx: mpsc::Sender<SystemEvent>) {
 
         if let Ok(state) = device.get_switch_state() {
             let is_tablet = state.contains(SwitchCode::SW_TABLET_MODE);
-            let _ = event_tx.send(SystemEvent::TabletMode(is_tablet));
+            let _ = event_tx.send(SystemEvent::TabletMode(is_tablet)).await;
         }
 
         let mut stream = match device.into_event_stream() {
@@ -89,7 +89,7 @@ async fn spawn_evdev_listener(event_tx: mpsc::Sender<SystemEvent>) {
                 && event.code() == SwitchCode::SW_TABLET_MODE.0
             {
                 let is_tablet = event.value() == 1;
-                let _ = event_tx.send(SystemEvent::TabletMode(is_tablet));
+                let _ = event_tx.send(SystemEvent::TabletMode(is_tablet)).await;
             }
         }
     });
@@ -155,15 +155,19 @@ async fn setup_sensor_proxy(
     let event_tx_clone = event_tx.clone();
     tokio::spawn(async move {
         while let Some(signal) = changes_stream.next().await {
+            debug!("new signal");
             if let Ok(args) = signal.args() {
                 for (key, value) in args.changed_properties() {
+                    debug!("changed_properties: key {}, value {:?}", key, value);
                     let Ok(value_owned) = value.try_to_owned() else {
                         continue;
                     };
-                    let _ = event_tx_clone.send(SystemEvent::SensorProperty {
-                        name: key.to_string(),
-                        value: value_owned,
-                    });
+                    let _ = event_tx_clone
+                        .send(SystemEvent::SensorProperty {
+                            name: key.to_string(),
+                            value: value_owned,
+                        })
+                        .await;
                 }
             }
         }
@@ -172,11 +176,15 @@ async fn setup_sensor_proxy(
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if let Ok(props) = props_proxy.get_all(interface_name).await {
+            debug!("get_all: new initial props");
             for (key, value) in props {
-                let _ = tx_clone_initial.send(SystemEvent::SensorProperty {
-                    name: key.to_string(),
-                    value,
-                });
+                debug!("key {}, value {:?}", key, value);
+                let _ = tx_clone_initial
+                    .send(SystemEvent::SensorProperty {
+                        name: key.to_string(),
+                        value,
+                    })
+                    .await;
             }
         }
     });
@@ -230,15 +238,16 @@ pub fn spawn_event_processor(mut internal_rx: mpsc::Receiver<SystemEvent>) -> Ev
     tokio::spawn(async move {
         let mut current_state = DeviceState::default();
         while let Some(sys_event) = internal_rx.recv().await {
+            debug!("new sys_event");
             if let Some(device_event) = parse_system_event(sys_event) {
                 current_state.apply_event(&device_event);
                 let _ = state_tx.send(current_state.clone());
                 if bus_event_tx.receiver_count() > 0 {
                     let _ = bus_event_tx.send(device_event.clone());
                 }
-                // if let Ok(json) = serde_json::to_string(&device_event) {
-                //     info!("[业务变更] {}", json);
-                // }
+                if let Ok(json) = serde_json::to_string(&device_event) {
+                    debug!("status {}", json);
+                }
             }
         }
     });
