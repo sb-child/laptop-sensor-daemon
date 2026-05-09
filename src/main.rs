@@ -38,61 +38,66 @@ pub enum DaemonError {
 
 type Result<T, E = DaemonError> = std::result::Result<T, E>;
 
-fn find_tablet_mode_device() -> Option<Device> {
-    let mut evdev_dir = std::fs::read_dir("/dev/input").ok()?;
-    while let Some(Ok(entry)) = evdev_dir.next() {
+fn find_tablet_mode_devices() -> Vec<Device> {
+    let mut devices = Vec::new();
+    let Ok(evdev_dir) = std::fs::read_dir("/dev/input") else {
+        return devices;
+    };
+    for entry in evdev_dir.flatten() {
         let path = entry.path();
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            if !metadata.file_type().is_char_device() {
-                continue;
-            }
-        }
-        if let Ok(device) = Device::open(&path) {
-            if device
-                .supported_switches()
-                .map_or(false, |sw| sw.contains(SwitchCode::SW_TABLET_MODE))
-            {
-                return Some(device);
+        if !path.is_dir()
+            && path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("event")
+        {
+            if let Ok(device) = Device::open(&path) {
+                if device
+                    .supported_switches()
+                    .map_or(false, |sw| sw.contains(SwitchCode::SW_TABLET_MODE))
+                {
+                    devices.push(device);
+                }
             }
         }
     }
-    None
+    devices
 }
 
 async fn spawn_evdev_listener(event_tx: mpsc::Sender<SystemEvent>) {
-    tokio::spawn(async move {
-        let Some(device) = find_tablet_mode_device() else {
-            warn!("未在系统中检测到平板模式物理开关。");
-            return;
-        };
-
-        info!(
-            "找到平板模式开关: {:?}",
-            device.physical_path().unwrap_or("Unknown")
-        );
-
-        if let Ok(state) = device.get_switch_state() {
-            let is_tablet = state.contains(SwitchCode::SW_TABLET_MODE);
-            let _ = event_tx.send(SystemEvent::TabletMode(is_tablet)).await;
-        }
-
-        let mut stream = match device.into_event_stream() {
-            Ok(s) => s,
-            Err(e) => {
-                error!("无法创建 evdev 异步流: {}", e);
-                return;
+    let devices = find_tablet_mode_devices();
+    if devices.is_empty() {
+        warn!("未在系统中检测到任何声明支持平板模式的物理开关。");
+        return;
+    }
+    for device in devices {
+        let tx_clone = event_tx.clone();
+        tokio::spawn(async move {
+            let phys = device.physical_path().unwrap_or("Unknown").to_string();
+            let name = device.name().unwrap_or("Unknown").to_string();
+            info!("挂载平板模式开关监听: {} (物理路径: {})", name, phys);
+            if let Ok(state) = device.get_switch_state() {
+                let is_tablet = state.contains(SwitchCode::SW_TABLET_MODE);
+                let _ = tx_clone.send(SystemEvent::TabletMode(is_tablet)).await;
             }
-        };
-
-        while let Ok(event) = stream.next_event().await {
-            if event.event_type() == EventType::SWITCH
-                && event.code() == SwitchCode::SW_TABLET_MODE.0
-            {
-                let is_tablet = event.value() == 1;
-                let _ = event_tx.send(SystemEvent::TabletMode(is_tablet)).await;
+            let mut stream = match device.into_event_stream() {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("无法创建 evdev 异步流 [{}]: {}", phys, e);
+                    return;
+                }
+            };
+            while let Ok(event) = stream.next_event().await {
+                if event.event_type() == EventType::SWITCH
+                    && event.code() == SwitchCode::SW_TABLET_MODE.0
+                {
+                    let is_tablet = event.value() == 1;
+                    let _ = tx_clone.send(SystemEvent::TabletMode(is_tablet)).await;
+                }
             }
-        }
-    });
+        });
+    }
 }
 
 #[zbus::proxy(
