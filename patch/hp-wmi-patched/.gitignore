@@ -6,6 +6,11 @@
 *.o.cmd
 .*.o.cmd
 .*.ko.cmd
+*.ko.xz
+*.mod
+.*.mod.cmd
+.*.order.cmd
+.*.symvers.cmd
 .tmp_versions/
 modules.order
 Module.symvers
